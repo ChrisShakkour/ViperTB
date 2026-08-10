@@ -110,14 +110,35 @@ def check_testbench(file_path: str) -> str:
         if not target.exists():
             return f"File not found: {file_path}"
 
-        # A file with zero @cocotb.test() functions or zero assert
-        # statements passes ruff cleanly but tests nothing — the single
-        # most likely "model gave up / wrote a stub" failure mode for this
-        # task, and otherwise invisible to a pure lint check. Checked
-        # before the lint call since it's a cheap, decisive signal on its
-        # own — no point spending a subprocess call on a file that's
-        # trivially not a real testbench yet.
         text = target.read_text(encoding="utf-8")
+
+        # compile() is a real, independent syntax check, not redundant with
+        # ruff below — confirmed directly that ruff's --select F can miss a
+        # genuine SyntaxError (e.g. `await` used inside a `def` that's
+        # missing `async`, a real mistake seen in an actual generated
+        # testbench: ruff reported "All checks passed!" on it). Note this
+        # must be compile(), not ast.parse(): ast.parse only checks
+        # grammar, but "await outside async function" is a semantic check
+        # CPython performs during compilation, not parsing — confirmed
+        # directly that ast.parse() does NOT raise on that exact case while
+        # compile() does. compile() runs in-process (no subprocess, no temp
+        # .pyc file — the returned code object is just discarded) and is
+        # the authoritative check, being the same step CPython itself would
+        # perform to run the file; ruff's F-rules are additionally useful
+        # for the undefined-name/unused-import/redefinition checks it does
+        # cover correctly, so both run rather than one replacing the other.
+        try:
+            compile(text, str(target), "exec")
+        except SyntaxError as e:
+            return f"Check failed: SyntaxError: {e.msg} (line {e.lineno}, column {e.offset})"
+
+        # A file with zero @cocotb.test() functions or zero assert
+        # statements passes both checks above cleanly but tests nothing —
+        # the single most likely "model gave up / wrote a stub" failure
+        # mode for this task, and otherwise invisible to either check.
+        # Checked before the ruff subprocess call since it's a cheap,
+        # decisive signal on its own — no point spending a subprocess call
+        # on a file that's trivially not a real testbench yet.
         if "@cocotb.test" not in text:
             return "Check failed: no @cocotb.test() function found — file defines no actual test."
         if "assert" not in text:
