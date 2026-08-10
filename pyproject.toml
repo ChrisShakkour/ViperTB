@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "testbench-agent"
+version = "0.1.0"
+description = "An agent that generates cocotb testbenches for not-yet-written SystemVerilog RTL modules."
+requires-python = ">=3.10"
+dependencies = [
+    "langchain-core",
+    "langchain-ollama",
+    "pyyaml",
+    # Static-analysis backend for check_testbench (src/tools.py) — catches
+    # syntax errors and undefined-name/unused-import bugs in the generated
+    # cocotb test file. Note cocotb itself is NOT a dependency here: this
+    # agent only ever writes testbench text, it never imports or executes
+    # cocotb, since there's no simulator or DUT in this project at all.
+    "ruff",
+]
+
+[tool.setuptools]
+py-modules = ["model", "tools", "testbench_agent", "config"]
+
+[tool.setuptools.package-dir]
+"" = "src"
