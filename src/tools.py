@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -9,6 +10,57 @@ from langchain_core.tools import tool
 # script's own directory so it can be freely cleared/gitignored without
 # touching the actual agent code.
 GENERATED_DIR = os.path.join(os.path.dirname(__file__), "generated")
+
+# _sim_runner.py is a standalone script (not imported), invoked as a
+# subprocess by simulate_testbench below for a hard timeout + isolation,
+# same reasoning as every other subprocess call in this file.
+SIM_RUNNER_PATH = os.path.join(os.path.dirname(__file__), "_sim_runner.py")
+
+# Matches every dut.<name> reference in a generated testbench.
+_DUT_REF_RE = re.compile(r"\bdut\.(\w+)\b")
+
+# Matches dut.<name>.value = ... (an assignment, driving the signal from the
+# testbench) but not dut.<name>.value == ... (a comparison) — the negative
+# lookahead rejects a second "=" right after the first. Confirmed directly
+# this correctly separates "assert dut.q.value == 0" (read) from
+# "dut.clk.value = 0" (write) on real generated content.
+_DUT_WRITE_RE = re.compile(r"dut\.(\w+)\.value\s*=(?!=)")
+
+# cocotb's own SimHandleBase surface — legitimate dut.<x> attribute
+# accesses that are never a real port name, so the stub generator must not
+# try to declare them as ports. Not exhaustive by construction (enumerated
+# from cocotb's documented dut object surface, not discovered empirically
+# from a crash) — extend if a real testbench legitimately uses something
+# not on this list.
+_DUT_INTERNAL_ATTRS = {"_log", "_name", "_path", "_id", "_handle", "_sub_handles"}
+
+# Parses the port-list comment/docstring the system prompt asks the model
+# to restate at the top of every file — two patterns since real generated
+# output has been observed using both "- name (direction, N bits)" and
+# "- name: direction, N-bit" phrasing for the same information. This is
+# NOT a bonus/fallback source — it is THE ground truth the placeholder
+# module is built from. Confirmed directly that deriving the stub's ports
+# from the testbench's own dut.<name> usage instead (the first version of
+# this code did that) is circular and can never catch a wrong signal name:
+# whatever the testbench references trivially "exists" in a stub generated
+# from those same references. Cross-checking dut.<name> usage against this
+# independently-declared list is what actually catches a typo — the same
+# idea as run_validation.py's port_mismatch_suspected heuristic, just
+# running live during generation instead of after the fact.
+_PORT_DECL_RE_A = re.compile(r"-\s*(\w+)\s*\((input|output),?\s*(\d+)[\s-]*bits?\)", re.IGNORECASE)
+_PORT_DECL_RE_B = re.compile(r"-\s*(\w+):\s*(input|output),\s*(\d+)[\s-]*bits?", re.IGNORECASE)
+
+
+def _parse_declared_ports(text: str) -> dict[str, tuple[str, int]]:
+    # -> {name: (direction, width)}. Pattern A checked first; pattern B
+    # only fills in names A didn't already find, so the two never disagree
+    # on the same signal.
+    declared = {}
+    for m in _PORT_DECL_RE_A.finditer(text):
+        declared[m.group(1)] = (m.group(2).lower(), int(m.group(3)))
+    for m in _PORT_DECL_RE_B.finditer(text):
+        declared.setdefault(m.group(1), (m.group(2).lower(), int(m.group(3))))
+    return declared
 
 
 def _resolve_safe_path(path: str) -> Path:
@@ -181,6 +233,93 @@ def check_testbench(file_path: str) -> str:
         return f"Failed to check {file_path}: {e}"
 
 
+def _generate_stub_dut(declared: dict[str, tuple[str, int]]) -> str:
+    # Builds a placeholder SystemVerilog module named TopModule with one
+    # port per DECLARED signal (from _parse_declared_ports) — no internal
+    # logic at all, since this exists purely so cocotb has something to
+    # attach signal handles to.
+    port_lines = []
+    for name in sorted(declared):
+        direction, width = declared[name]
+        width_decl = "" if width == 1 else f"[{width - 1}:0] "
+        port_lines.append(f"    {direction} logic {width_decl}{name}")
+
+    ports = ",\n".join(port_lines)
+    # `timescale is required — Icarus's default simulator precision (1s)
+    # can't represent a typical ns-scale cocotb Clock period at all,
+    # confirmed directly: without this, Clock(..., 10, unit="ns") fails
+    # with "Unable to accurately represent 10(ns) with the simulator
+    # precision of 1e0" before any real test logic even runs.
+    return f"`timescale 1ns/1ps\nmodule TopModule(\n{ports}\n);\nendmodule\n"
+
+
+@tool
+def simulate_testbench(file_path: str) -> str:
+    """Actually run a cocotb testbench (.py) against an auto-generated placeholder module with no real logic, using Icarus Verilog — this is a smoke test, not a correctness check: it exists to catch real runtime bugs a static check can't see (wrong/undeclared signal names, bad async/await usage, indexing errors, invalid values), not to confirm the design behaves correctly, since the placeholder module has no behavior of its own to compare against. The placeholder's ports come from the port-list comment you restate at the top of the file, not from scanning your own dut.<name> usage — so restate it accurately, since it's the only ground truth this tool has."""
+    try:
+        target = _resolve_safe_path(file_path)
+        if not target.exists():
+            return f"File not found: {file_path}"
+
+        text = target.read_text(encoding="utf-8")
+        if "@cocotb.test" not in text:
+            return "Simulation failed: no @cocotb.test() function found — nothing to run."
+
+        declared = _parse_declared_ports(text)
+        if not declared:
+            return (
+                "Simulation failed: no parseable port-list comment found at the top of "
+                "the file (expected a line per port like '- name (direction, N bits)'). "
+                "Add one — it's what the placeholder module is built from."
+            )
+
+        # Checked before ever invoking the simulator: both are purely
+        # textual cross-checks against the declared list, cheap and
+        # deterministic, and catch exactly the two failure modes a live
+        # simulator run can't distinguish from a real design bug (there is
+        # no real design here to blame either way).
+        referenced = set(_DUT_REF_RE.findall(text)) - _DUT_INTERNAL_ATTRS
+        undeclared = sorted(referenced - declared.keys())
+        if undeclared:
+            return (
+                f"Simulation failed: signal(s) {', '.join(undeclared)} are used in the "
+                "testbench but not in the restated port-list comment — likely a typo of "
+                "a declared port name, or a port missing from the list."
+            )
+
+        written = set(_DUT_WRITE_RE.findall(text))
+        written_outputs = sorted(n for n in written if declared[n][0] == "output")
+        if written_outputs:
+            return (
+                f"Simulation failed: signal(s) {', '.join(written_outputs)} are declared "
+                "as output in the port list, but the testbench assigns a value to them — "
+                "a testbench should only ever drive inputs and read outputs."
+            )
+
+        base = Path(GENERATED_DIR).resolve()
+        stub_path = base / "_stub_dut.sv"
+        stub_path.write_text(_generate_stub_dut(declared), encoding="utf-8")
+        build_dir = base / "_sim_build"
+
+        result = subprocess.run(
+            [sys.executable, SIM_RUNNER_PATH, str(target), str(stub_path), str(build_dir)],
+            capture_output=True, text=True, timeout=60,
+        )
+        log = (result.stdout + result.stderr).strip()
+
+        if result.returncode == 0:
+            return log or "Simulation succeeded — no errors."
+        return f"Simulation failed:\n{log}"
+
+    except subprocess.TimeoutExpired:
+        # A testbench with no exit condition (e.g. an await loop waiting
+        # for a value the placeholder module can never produce, since it
+        # has no logic) would otherwise hang forever — this is the backstop.
+        return f"Simulation of {file_path} timed out after 60s — check for an await/loop with no way to complete against a placeholder module."
+    except (OSError, ValueError) as e:
+        return f"Failed to simulate {file_path}: {e}"
+
+
 @tool
 def list_directory(path: str = ".") -> str:
     """List files and subdirectories at a path, to discover project structure and existing testbenches."""
@@ -205,8 +344,12 @@ def list_directory(path: str = ".") -> str:
 # rather than unpacking it as keyword arguments (see testbench_agent.py).
 BASE_TOOLS = [write_file, read_file, edit_file_block, list_directory]
 
-# No BUILD_TOOL_FUNCTIONS/BUILD_FAILURE_PREFIXES dicts, unlike TigressRTL —
-# those existed there to abstract over which of two mutually exclusive
-# backends (icarus/slang) is active. There's only one check tool here, so
-# testbench_agent.py references check_testbench and its failure prefix
-# ("Check failed") directly instead of through a single-key dict.
+# check_testbench and simulate_testbench are not mutually exclusive
+# backends the way TigressRTL's icarus/slang are — they're two stages of
+# the same check, run in sequence: testbench_agent.py auto-runs
+# check_testbench after every write/edit, and only if that's clean does it
+# also auto-run simulate_testbench (no point spending 60s building and
+# simulating Python that's already known to be broken). Both are still
+# exposed as explicitly callable tools too, same as check_testbench alone
+# was before, so the model can re-run either on its own if it wants to.
+CHECK_TOOLS = [check_testbench, simulate_testbench]

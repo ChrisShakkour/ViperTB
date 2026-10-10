@@ -13,10 +13,18 @@ dependencies = [
     "pyyaml",
     # Static-analysis backend for check_testbench (src/tools.py) — catches
     # syntax errors and undefined-name/unused-import bugs in the generated
-    # cocotb test file. Note cocotb itself is NOT a dependency here: this
-    # agent only ever writes testbench text, it never imports or executes
-    # cocotb, since there's no simulator or DUT in this project at all.
+    # cocotb test file.
     "ruff",
+    # simulate_testbench (src/tools.py) actually runs the generated
+    # testbench against an auto-generated placeholder module with no real
+    # logic, via cocotb_tools.runner + Icarus Verilog — a smoke test to
+    # catch runtime bugs (wrong signal names, bad async/await usage) a
+    # static check can't see. In cocotb 2.0, the runner API moved out of
+    # the main `cocotb` package into the separate `cocotb-tools` package —
+    # confirmed directly (`cocotb.runner` raises ModuleNotFoundError on
+    # this version; `cocotb_tools.runner` is the real import path).
+    "cocotb",
+    "cocotb-tools",
 ]
 
 [tool.setuptools]
